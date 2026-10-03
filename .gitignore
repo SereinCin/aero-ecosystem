@@ -1,0 +1,10 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Compiled native kernel (built locally; shipped via wheel/Release)
+*.pyd
+*.aero-cache/

@@ -1,0 +1,2041 @@
+// aero-jmespath kernel v0.2: JSON parser + serializer over a flat value vals.
+//
+// Every JSON value lives in a single `Vec<Jv>` vals; arrays/objects store
+// vals indices. An object is a flat `Vec<i64>` of `[key_index, value_index, ...]`
+// pairs (key_index points to a string value in the vals), preserving key names.
+//
+// Numbers are stored as i64 in fixed-point micro-units (value * 1e6). Aero has no
+// i64->f64 conversion and extern "C" cannot return f64, so a 1e6 fixed point is the
+// portable way to do numeric compare + serialize without floats. All compliance
+// numbers are short decimals, well within i64 range.
+//
+// Built with `aero build src/kernel.aero --pyext` -> kernel.pyd / kernel.so.
+
+enum Jv {
+    Null,
+    B(bool),
+    N(i64),           // number: value * 1e6 (fixed point)
+    S(str),           // NUL-terminated string buffer (vals-owned, leaked deliberately)
+    A(Vec<i64>),      // array: vals indices
+    O(Vec<i64>),      // object: [key_idx, val_idx, ...]
+}
+
+fn ws_skip(data: str, n: i64, pos: &mut i64) {
+    while (*pos < n) {
+        let c = data[*pos];
+        if ((c == 32) || (c == 9) || (c == 10) || (c == 13)) {
+            *pos = *pos + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn hex_val(c: i64) -> i64 {
+    if ((c >= 48) && (c <= 57)) { return c - 48; }
+    if ((c >= 65) && (c <= 70)) { return c - 55; }
+    if ((c >= 97) && (c <= 102)) { return c - 87; }
+    return 0;
+}
+
+// Read a `\uXXXX` escape (caller has consumed the `\u`) and return the code point.
+fn read_hex4(data: str, pos: i64) -> i64 {
+    let h0 = hex_val(data[pos]);
+    let h1 = hex_val(data[pos + 1]);
+    let h2 = hex_val(data[pos + 2]);
+    let h3 = hex_val(data[pos + 3]);
+    return h0 * 4096 + h1 * 256 + h2 * 16 + h3;
+}
+
+// Append code point `cp` as UTF-8 into an owned String and return it (String is
+// a move type; &mut String receivers can't call String methods in Aero).
+fn utf8_push_std(sb: String, cp: i64) -> String {
+    if (cp < 128) {
+        sb.push(cp);
+    } else if (cp < 2048) {
+        sb.push(192 + (cp / 64));
+        sb.push(128 + (cp % 64));
+    } else if (cp < 65536) {
+        sb.push(224 + (cp / 4096));
+        sb.push(128 + ((cp / 64) % 64));
+        sb.push(128 + (cp % 64));
+    } else {
+        sb.push(240 + (cp / 262144));
+        sb.push(128 + ((cp / 4096) % 64));
+        sb.push(128 + ((cp / 64) % 64));
+        sb.push(128 + (cp % 64));
+    }
+    return sb;
+}
+
+fn parse_string(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    *pos = *pos + 1; // consume opening quote
+    let mut sb: String = String::with_cap(8);
+    let esc = 0;
+    let closed = 0;
+    while (*pos < n) {
+        let c = data[*pos];
+        if (esc == 1) {
+            if (c == 34) { sb.push(34); *pos = *pos + 1; }
+            else if (c == 92) { sb.push(92); *pos = *pos + 1; }
+            else if (c == 47) { sb.push(47); *pos = *pos + 1; }
+            else if (c == 98) { sb.push(8); *pos = *pos + 1; }
+            else if (c == 102) { sb.push(12); *pos = *pos + 1; }
+            else if (c == 110) { sb.push(10); *pos = *pos + 1; }
+            else if (c == 114) { sb.push(13); *pos = *pos + 1; }
+            else if (c == 116) { sb.push(9); *pos = *pos + 1; }
+            else if (c == 117) {
+                // \uXXXX with optional surrogate pair
+                let cp = read_hex4(data, *pos + 1);
+                if ((cp >= 55296) && (cp <= 56319)) {
+                    // high surrogate: expect a following \uXXXX low surrogate
+                    if ((*pos + 7 < n) && (data[*pos + 5] == 92) && (data[*pos + 6] == 117)) {
+                        let lo = read_hex4(data, *pos + 7);
+                        let combined = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                        sb = utf8_push_std(sb, combined);
+                        *pos = *pos + 11;
+                    } else {
+                        // lone high surrogate: emit as-is (best effort)
+                        sb = utf8_push_std(sb, cp);
+                        *pos = *pos + 5;
+                    }
+                } else {
+                    sb = utf8_push_std(sb, cp);
+                    *pos = *pos + 5;
+                }
+            } else {
+                sb.push(c);
+                *pos = *pos + 1;
+            }
+            esc = 0;
+        } else if (c == 92) {
+            esc = 1;
+            *pos = *pos + 1;
+        } else if (c == 34) {
+            *pos = *pos + 1;
+            closed = 1;
+            break;
+        } else {
+            sb.push(c);
+            *pos = *pos + 1;
+        }
+    }
+    if (closed == 0) {
+        *err = 1;
+    }
+    let s = sb.data();
+    vals.push(Jv::S(s));
+    return vals.len() - 1;
+}
+
+fn pow10(k: i64) -> i64 {
+    let mut r: i64 = 1;
+    let mut i: i64 = 0;
+    while (i < k) {
+        r = r * 10;
+        i = i + 1;
+    }
+    return r;
+}
+
+// Parse the JSON number token data[start..end] into fixed-point micros
+// (value * 1e6). Reads bytes directly with known bounds; no strlen/substr.
+fn parse_fixed_range(data: str, start: i64, end: i64) -> i64 {
+    let mut i = start;
+    let mut neg = 0;
+    if ((i < end) && (data[i] == 45)) {
+        neg = 1;
+        i = i + 1;
+    }
+    let int_start = i;
+    while ((i < end) && (data[i] >= 48) && (data[i] <= 57)) {
+        i = i + 1;
+    }
+    let int_end = i;
+    let mut frac_digits: i64 = 0;
+    let mut frac_start: i64 = -1;
+    if ((i < end) && (data[i] == 46)) {
+        i = i + 1;
+        frac_start = i;
+        while ((i < end) && (data[i] >= 48) && (data[i] <= 57)) {
+            i = i + 1;
+        }
+        frac_digits = i - frac_start;
+    }
+    let mut exp: i64 = 0;
+    if ((i < end) && ((data[i] == 101) || (data[i] == 69))) {
+        i = i + 1;
+        let mut eneg = 0;
+        if ((i < end) && (data[i] == 45)) {
+            eneg = 1;
+            i = i + 1;
+        } else if ((i < end) && (data[i] == 43)) {
+            i = i + 1;
+        }
+        let mut e: i64 = 0;
+        while ((i < end) && (data[i] >= 48) && (data[i] <= 57)) {
+            e = e * 10 + (data[i] - 48);
+            i = i + 1;
+        }
+        if (eneg == 1) {
+            exp = 0 - e;
+        } else {
+            exp = e;
+        }
+    }
+    let mut ip: i64 = 0;
+    let mut k = int_start;
+    while (k < int_end) {
+        ip = ip * 10 + (data[k] - 48);
+        k = k + 1;
+    }
+    let mut mantissa = ip;
+    if (frac_start >= 0) {
+        let mut fp: i64 = 0;
+        let mut k2 = frac_start;
+        while (k2 < frac_start + frac_digits) {
+            fp = fp * 10 + (data[k2] - 48);
+            k2 = k2 + 1;
+        }
+        mantissa = ip * pow10(frac_digits) + fp;
+    }
+    let scale = 6 - frac_digits + exp;
+    let mut value: i64 = 0;
+    if (scale >= 0) {
+        value = mantissa * pow10(scale);
+    } else {
+        value = mantissa / pow10(0 - scale);
+    }
+    if (neg == 1) {
+        value = 0 - value;
+    }
+    return value;
+}
+
+fn parse_number(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>) -> i64 {
+    let start = *pos;
+    while (*pos < n) {
+        let c = data[*pos];
+        if ((c >= 48) && (c <= 57)) {
+            *pos = *pos + 1;
+        } else if ((c == 46) || (c == 101) || (c == 69) || (c == 45) || (c == 43)) {
+            *pos = *pos + 1;
+        } else {
+            break;
+        }
+    }
+    let v = parse_fixed_range(data, start, *pos);
+    vals.push(Jv::N(v));
+    return vals.len() - 1;
+}
+
+fn parse_value(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    ws_skip(data, n, pos);
+    let c = data[*pos];
+    if (c == 123) { return parse_object(data, n, pos, vals, err); }
+    if (c == 91) { return parse_array(data, n, pos, vals, err); }
+    if (c == 34) { return parse_string(data, n, pos, vals, err); }
+    if (c == 116) { *pos = *pos + 4; vals.push(Jv::B(true)); return vals.len() - 1; }
+    if (c == 102) { *pos = *pos + 5; vals.push(Jv::B(false)); return vals.len() - 1; }
+    if (c == 110) { *pos = *pos + 4; vals.push(Jv::Null); return vals.len() - 1; }
+    let num_start = ((c >= 48) && (c <= 57)) || (c == 45);
+    if (b2i(num_start) == 0) {
+        *err = 1;
+        return 0;
+    }
+    return parse_number(data, n, pos, vals);
+}
+
+fn parse_array(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    *pos = *pos + 1;
+    let items: Vec<i64> = Vec::with_cap(8);
+    let closed = 0;
+    ws_skip(data, n, pos);
+    if (data[*pos] == 93) {
+        *pos = *pos + 1;
+        vals.push(Jv::A(items));
+        return vals.len() - 1;
+    }
+    while (*pos < n) {
+        let vi = parse_value(data, n, pos, vals, err);
+        if (*err != 0) { return 0; }
+        items.push(vi);
+        ws_skip(data, n, pos);
+        if (data[*pos] == 44) {
+            *pos = *pos + 1;
+        } else if (data[*pos] == 93) {
+            *pos = *pos + 1;
+            closed = 1;
+            break;
+        } else {
+            *err = 1;
+            break;
+        }
+    }
+    if (closed == 0) {
+        *err = 1;
+    }
+    vals.push(Jv::A(items));
+    return vals.len() - 1;
+}
+
+fn parse_object(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    *pos = *pos + 1;
+    let pairs: Vec<i64> = Vec::with_cap(16);
+    ws_skip(data, n, pos);
+    if (data[*pos] == 125) {
+        *pos = *pos + 1;
+        vals.push(Jv::O(pairs));
+        return vals.len() - 1;
+    }
+    while (*pos < n) {
+        ws_skip(data, n, pos);
+        // JSON object keys must be quoted strings.
+        if (data[*pos] != 34) {
+            *err = 1;
+            return 0;
+        }
+        let ki = parse_string(data, n, pos, vals, err);
+        if (*err != 0) { return 0; }
+        ws_skip(data, n, pos);
+        if (data[*pos] == 58) {
+            *pos = *pos + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+        let vi = parse_value(data, n, pos, vals, err);
+        if (*err != 0) { return 0; }
+        pairs.push(ki);
+        pairs.push(vi);
+        ws_skip(data, n, pos);
+        if (data[*pos] == 44) {
+            *pos = *pos + 1;
+        } else if (data[*pos] == 125) {
+            *pos = *pos + 1;
+            break;
+        } else {
+            *err = 1;
+            break;
+        }
+    }
+    vals.push(Jv::O(pairs));
+    return vals.len() - 1;
+}
+
+// ---- value helpers ----
+
+fn as_str(v: Jv) -> str {
+    match (v) {
+        S(s) => { return s; }
+        _ => { return ""; }
+    }
+}
+
+fn as_arr(v: Jv) -> Vec<i64> {
+    match (v) {
+        A(a) => { return a; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn as_obj(v: Jv) -> Vec<i64> {
+    match (v) {
+        O(o) => { return o; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn as_num(v: Jv) -> i64 {
+    match (v) {
+        N(x) => { return x; }
+        _ => { return 0; }
+    }
+}
+
+fn as_bool(v: Jv) -> bool {
+    match (v) {
+        B(x) => { return x; }
+        _ => { return false; }
+    }
+}
+
+// bool -> 0/1 so we can compare booleans with numeric `==`.
+fn b2i(x: bool) -> i64 {
+    if (x) { return 1; }
+    return 0;
+}
+
+// ---- serializer ----
+
+// Append a NUL-terminated `str` to the byte output buffer.
+fn push_s(buf: &mut Vec<i64>, s: str) {
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        buf.push(s[i]);
+        i = i + 1;
+    }
+}
+
+// Copy a byte buffer into a fresh String and return its NUL-terminated data
+// pointer (the String is intentionally leaked; the buffer outlives the call).
+fn bytes_to_str(buf: &mut Vec<i64>) -> str {
+    let sb = String::new();
+    let n = buf.len();
+    let i = 0;
+    while (i < n) {
+        sb.push(buf.get(i));
+        i = i + 1;
+    }
+    return sb.data();
+}
+
+// Copy a byte buffer into an owned String.
+fn bytes_to_string(buf: &mut Vec<i64>) -> String {
+    let sb = String::new();
+    let n = buf.len();
+    let i = 0;
+    while (i < n) {
+        sb.push(buf.get(i));
+        i = i + 1;
+    }
+    return sb;
+}
+
+fn ser_string_raw(s: str, out: &mut Vec<i64>) {
+    out.push(34);
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c == 34) { push_s(out, "\\\""); }
+        else if (c == 92) { push_s(out, "\\\\"); }
+        else if (c == 10) { push_s(out, "\\n"); }
+        else if (c == 13) { push_s(out, "\\r"); }
+        else if (c == 9) { push_s(out, "\\t"); }
+        else if (c == 8) { push_s(out, "\\b"); }
+        else if (c == 12) { push_s(out, "\\f"); }
+        else { out.push(c); }
+        i = i + 1;
+    }
+    out.push(34);
+}
+
+// Fixed-point micros -> JSON number text ("25", "33.3", "-0.5", ...).
+fn num_to_str(v: i64) -> str {
+    let out = String::new();
+    let neg = (v < 0);
+    let mut a = v;
+    if (neg) {
+        a = 0 - a;
+        out.push(45);
+    }
+    let ip = a / 1000000;
+    let fp = a % 1000000;
+    out.push_str(int_to_str(ip));
+    if (fp > 0) {
+        out.push(46);
+        let fs = format("%06lld", fp);
+        let n = len(fs);
+        let mut end = n;
+        while ((end > 0) && (fs[end - 1] == 48)) {
+            end = end - 1;
+        }
+        let sub = substr(fs, 0, end);
+        str_free(fs);
+        out.push_str(sub);
+        str_free(sub);
+    }
+    return out.data();
+}
+
+// Index-based serializer: `idx` is a value-vals index. Avoiding passing Jv by
+// value in the recursive call keeps the stack frame small (an i64 vs a 32-byte
+// enum) so deep flat arrays don't exhaust the ~1MB pyext thread stack.
+fn ser_idx(idx: i64, vals: &Vec<Jv>, out: &mut Vec<i64>) {
+    match (vals.get(idx)) {
+        Null => { push_s(out, "null"); }
+        B(b) => { if (b) { push_s(out, "true"); } else { push_s(out, "false"); } }
+        N(x) => {
+            let s = num_to_str(x);
+            push_s(out, s);
+            str_free(s);
+        }
+        S(s) => { ser_string_raw(s, out); }
+        A(items) => {
+            out.push(91);
+            let n = items.len();
+            let i = 0;
+            while (i < n) {
+                if (i > 0) { out.push(44); }
+                ser_idx(items.get(i), vals, out);
+                i = i + 1;
+            }
+            out.push(93);
+        }
+        O(pairs) => {
+            out.push(123);
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                if (i > 0) { out.push(44); }
+                let ki = pairs.get(i);
+                let vi = pairs.get(i + 1);
+                ser_string_raw(as_str(vals.get(ki)), out);
+                out.push(58);
+                ser_idx(vi, vals, out);
+                i = i + 2;
+            }
+            out.push(125);
+        }
+    }
+}
+
+fn json_root(data: str) -> String {
+    let pos = 0;
+    let n = len(data);
+    let vals: Vec<Jv> = Vec::new();
+    let mut jerr: i64 = 0;
+    let root = parse_value(data, n, &mut pos, &mut vals, &mut jerr);
+    let mut out: Vec<i64> = Vec::new();
+    ser_idx(root, &vals, &mut out);
+    return bytes_to_string(&mut out);
+}
+
+#[py_export]
+fn parse_json(data: str) -> String {
+    return json_root(data);
+}
+
+// Debug helper: parse only (no serialization), return the value count.
+#[py_export]
+fn parse_only(data: str) -> i64 {
+    let vals: Vec<Jv> = Vec::new();
+    let pos = 0;
+    let n = len(data);
+    let mut jerr: i64 = 0;
+    parse_value(data, n, &mut pos, &mut vals, &mut jerr);
+    return vals.len();
+}
+
+fn ser_one(x: i64, out: &mut Vec<i64>) {
+    out.push(48 + x);
+}
+
+// Debug: non-recursive loop building "[0,0,...]".
+#[py_export]
+fn ser_loop(n: i64) -> String {
+    let mut out: Vec<i64> = Vec::new();
+    out.push(91);
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (i > 0) { out.push(44); }
+        out.push(48);
+        i = i + 1;
+    }
+    out.push(93);
+    return bytes_to_string(&mut out);
+}
+
+// Debug: loop calling a void recursive helper per element (mirrors ser_value).
+#[py_export]
+fn ser_rec(n: i64) -> String {
+    let mut out: Vec<i64> = Vec::new();
+    out.push(91);
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (i > 0) { out.push(44); }
+        ser_one(0, &mut out);
+        i = i + 1;
+    }
+    out.push(93);
+    return bytes_to_string(&mut out);
+}
+
+// Debug: build a flat array of n zeros and serialize it with the real ser_value.
+#[py_export]
+fn ser_test(n: i64) -> String {
+    let mut vals: Vec<Jv> = Vec::new();
+    vals.push(Jv::N(0));
+    let mut items: Vec<i64> = Vec::new();
+    let mut i: i64 = 0;
+    while (i < n) {
+        items.push(0);
+        i = i + 1;
+    }
+    vals.push(Jv::A(items));
+    let mut out: Vec<i64> = Vec::new();
+    ser_idx(1, &vals, &mut out);
+    return bytes_to_string(&mut out);
+}
+
+// =====================================================================
+// JSONPath expression layer (lexer + Pratt parser + evaluator)
+// =====================================================================
+//
+// Ported from jsonpath-ng's grammar (base + ext). Supported subset:
+//   fields  : foo, foo.bar, *, [foo], ['foo'], ["foo"], [foo,bar], [*]
+//   index   : [0], [0,1], [5]
+//   slice   : [1:], [1:3], [:2], [:3:2], [1::2], [1:6:3], [::-2]
+//   root    : $
+//   this    : @, `this`
+//   parent  : `parent`
+//   descend : foo..bar
+//   where   : a where b, a wherenot b
+//   union   : a | b
+//   filter  : [?(expr)] with == != < <= > >= and existence checks
+// Errors are signalled through `err`: 0 = ok, 1 = syntax.
+// `search()` returns a JSON array of matched values, or "\x1eERR1".
+
+#[derive(Copy)]
+enum PTok {
+    Eof,
+    Field(i64),     // field name -> S index in the value vals
+    Num(i64),       // integer (for index/slice)
+    Root,           // $
+    Cur,            // @ (this)
+    Star,           // *
+    Dot,            // .
+    Ddot,           // ..
+    Lb, Rb,         // [ ]
+    Lp, Rp,         // ( )
+    Comma, Colon,
+    Pipe,           // |
+    Amp,            // &
+    Where, WhereNot,
+    Filter,         // [?
+    Gt, Ge, Lt, Le, Eq, Ne,   // filter operators
+    Tilde,          // ~ (for =~)
+    Bool(i64),      // true / false literal
+    Str(i64),       // quoted string -> S index in the value vals
+    FNum(i64),      // float literal -> fixed-point micros (for filter RHS)
+}
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+struct Tri {
+    a: i64,
+    b: i64,
+    c: i64,
+}
+
+enum PAst {
+    Root,
+    This,
+    Fields(Vec<i64>),    // S indices; empty vec = '*' wildcard
+    Index(Vec<i64>),
+    Slice(Tri),          // a=start b=end c=step (none_sentinel = omitted)
+    Child(Pair),         // a=left b=right
+    Desc(Pair),          // a=left b=right (..)
+    Where(Pair),         // a=left b=right
+    Union(Pair),         // a=left b=right
+    Filter(Vec<i64>),    // filter-expression indices into fxs
+}
+
+// A filter condition: left = ast index, op = 0 none /1 eq /2 ne /3 lt /4 le
+// /5 gt /6 ge, right = value index in vals (-1 for op==none).
+struct Fx {
+    l: i64,
+    op: i64,
+    r: i64,
+    ri: i64,   // r_is_int: 1 if RHS was an integer literal (jsonpath-ng truncates LHS to int)
+}
+
+fn ptok_type(t: PTok) -> i64 {
+    match (t) {
+        PTok::Eof => { return 0; }
+        PTok::Field(x) => { return 1; }
+        PTok::Num(x) => { return 2; }
+        PTok::Root => { return 3; }
+        PTok::Cur => { return 4; }
+        PTok::Star => { return 5; }
+        PTok::Dot => { return 6; }
+        PTok::Ddot => { return 7; }
+        PTok::Lb => { return 8; }
+        PTok::Rb => { return 9; }
+        PTok::Lp => { return 10; }
+        PTok::Rp => { return 11; }
+        PTok::Comma => { return 12; }
+        PTok::Colon => { return 13; }
+        PTok::Pipe => { return 14; }
+        PTok::Amp => { return 15; }
+        PTok::Where => { return 16; }
+        PTok::WhereNot => { return 17; }
+        PTok::Filter => { return 18; }
+        PTok::Gt => { return 19; }
+        PTok::Ge => { return 20; }
+        PTok::Lt => { return 21; }
+        PTok::Le => { return 22; }
+        PTok::Eq => { return 23; }
+        PTok::Ne => { return 24; }
+        PTok::Tilde => { return 25; }
+        PTok::Bool(x) => { return 26; }
+        PTok::Str(x) => { return 27; }
+        PTok::FNum(x) => { return 28; }
+    }
+    return -1;
+}
+
+// Left binding power for the Pratt parser. JSONPath's low-precedence
+// operators (where/wherenot/|/&) come after postfix (field/index/slice).
+fn ptok_bp(t: PTok) -> i64 {
+    let ty = ptok_type(t);
+    if (ty == 16) { return 10; }   // where
+    if (ty == 17) { return 10; }   // wherenot
+    if (ty == 14) { return 20; }   // |
+    if (ty == 15) { return 20; }   // &
+    return 0;
+}
+
+fn ptok_field(t: PTok) -> i64 {
+    match (t) {
+        PTok::Field(x) => { return x; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ptok_num(t: PTok) -> i64 {
+    match (t) {
+        PTok::Num(x) => { return x; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ptok_str(t: PTok) -> i64 {
+    match (t) {
+        PTok::Str(x) => { return x; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ptok_bool(t: PTok) -> i64 {
+    match (t) {
+        PTok::Bool(x) => { return x; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ptok_fnum(t: PTok) -> i64 {
+    match (t) {
+        PTok::FNum(x) => { return x; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn pas_push(ast: &mut Vec<PAst>, node: PAst) -> i64 {
+    ast.push(node);
+    return ast.len() - 1;
+}
+
+fn ast_is_field(a: i64, ast: &mut Vec<PAst>) -> i64 {
+    match (ast.get(a)) {
+        Fields(c) => { return 1; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ast_field_children(a: i64, ast: &mut Vec<PAst>) -> Vec<i64> {
+    match (ast.get(a)) {
+        Fields(c) => { return c; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn ast_is_index(a: i64, ast: &mut Vec<PAst>) -> i64 {
+    match (ast.get(a)) {
+        Index(c) => { return 1; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ast_is_slice(a: i64, ast: &mut Vec<PAst>) -> i64 {
+    match (ast.get(a)) {
+        Slice(t) => { return 1; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ast_pair(a: i64, ast: &mut Vec<PAst>) -> Pair {
+    match (ast.get(a)) {
+        Child(p) => { return p; }
+        Desc(p) => { return p; }
+        PAst::Where(p) => { return p; }
+        PAst::Union(p) => { return p; }
+        _ => { let e = Pair { a: 0, b: 0 }; return e; }
+    }
+}
+
+fn ast_slice_tri(a: i64, ast: &mut Vec<PAst>) -> Tri {
+    match (ast.get(a)) {
+        Slice(t) => { return t; }
+        _ => { let e = Tri { a: 0, b: 0, c: 0 }; return e; }
+    }
+}
+
+fn ast_filter_children(a: i64, ast: &mut Vec<PAst>) -> Vec<i64> {
+    match (ast.get(a)) {
+        PAst::Filter(c) => { return c; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn is_ident_start(c: i64) -> i64 {
+    let a = ((c >= 65) && (c <= 90));
+    let b = ((c >= 97) && (c <= 122));
+    let c2 = (c == 95);
+    // CJK / emoji range bytes are >= 0x80; treat any >= 0x80 byte as ident
+    let d = (c >= 128);
+    if (b2i(a) == 1) { return 1; }
+    if (b2i(b) == 1) { return 1; }
+    if (b2i(c2) == 1) { return 1; }
+    if (b2i(d) == 1) { return 1; }
+    return 0;
+}
+
+fn is_ident_cont(c: i64) -> i64 {
+    let a = is_ident_start(c);
+    let b = ((c >= 48) && (c <= 57));
+    let c2 = (c == 45);  // hyphens are legal in jsonpath identifiers
+    if (a == 1) { return 1; }
+    if (b2i(b) == 1) { return 1; }
+    if (b2i(c2) == 1) { return 1; }
+    return 0;
+}
+
+// Scan a bare identifier (or @-prefixed field) at data[pos]. Returns its
+// S index in vals, advancing pos. Hyphens are part of identifiers, so
+// `bar-baz` is one field.
+fn lex_ident(data: str, pos: &mut i64, vals: &mut Vec<Jv>) -> i64 {
+    let n = len(data);
+    let start = *pos;
+    while ((*pos < n) && (is_ident_cont(data[*pos]) == 1)) {
+        *pos = *pos + 1;
+    }
+    let sub = substr(data, start, *pos);
+    let sidx = push_str_value(vals, sub);
+    return sidx;
+}
+
+// Decode a quoted string ('...' or "..." or `...`) at data[pos]. Returns
+// its S index in vals. Backslash escapes the next char (jsonpath-ng drops
+// the backslash, keeping the escaped char).
+fn lex_quoted(data: str, pos: &mut i64, quote: i64, vals: &mut Vec<Jv>) -> i64 {
+    let n = len(data);
+    *pos = *pos + 1; // opening quote
+    let sb: Vec<i64> = Vec::new();
+    while (*pos < n) {
+        let c = data[*pos];
+        if (c == quote) {
+            *pos = *pos + 1;
+            break;
+        } else if (c == 92) {
+            if (*pos + 1 < n) {
+                sb.push(data[*pos + 1]);
+                *pos = *pos + 2;
+            } else {
+                *pos = *pos + 1;
+            }
+        } else {
+            sb.push(c);
+            *pos = *pos + 1;
+        }
+    }
+    let s = bytes_to_str(&mut sb);
+    let sidx = push_str_value(vals, s);
+    return sidx;
+}
+
+fn is_digit(c: i64) -> i64 {
+    if ((c >= 48) && (c <= 57)) { return 1; }
+    return 0;
+}
+
+fn str_to_i64_parse(s: str) -> i64 {
+    let n = len(s);
+    let mut v: i64 = 0;
+    let mut i = 0;
+    while (i < n) {
+        if (is_digit(s[i]) == 1) {
+            v = v * 10 + (s[i] - 48);
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn push_str_value(vals: &mut Vec<Jv>, s: str) -> i64 {
+    vals.push(Jv::S(s));
+    return vals.len() - 1;
+}
+
+// Push a JSON number value (fixed-point micros) into the value vals.
+fn push_num_value(vals: &mut Vec<Jv>, n: i64) -> i64 {
+    vals.push(Jv::N(n * 1000000));
+    return vals.len() - 1;
+}
+
+// Push a raw fixed-point micro value (already in micros) into the value vals.
+fn push_num_raw(vals: &mut Vec<Jv>, v: i64) -> i64 {
+    vals.push(Jv::N(v));
+    return vals.len() - 1;
+}
+
+// Push a JSON bool value into the value vals.
+fn push_bool_value(vals: &mut Vec<Jv>, b: i64) -> i64 {
+    if (b == 1) { vals.push(Jv::B(true)); } else { vals.push(Jv::B(false)); }
+    return vals.len() - 1;
+}
+
+fn none_sentinel() -> i64 {
+    return -2147483648;
+}
+
+fn plex(expr: str, vals: &mut Vec<Jv>, err: &mut i64) -> Vec<PTok> {
+    let toks: Vec<PTok> = Vec::new();
+    let n = len(expr);
+    let mut pos: i64 = 0;
+    while (pos < n) {
+        let c = expr[pos];
+        if ((c == 32) || (c == 9) || (c == 10) || (c == 13)) {
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 36) { toks.push(PTok::Root); pos = pos + 1; continue; }   // $
+        if (c == 42) { toks.push(PTok::Star); pos = pos + 1; continue; }   // *
+        if (c == 44) { toks.push(PTok::Comma); pos = pos + 1; continue; }
+        if (c == 58) { toks.push(PTok::Colon); pos = pos + 1; continue; }
+        if (c == 40) { toks.push(PTok::Lp); pos = pos + 1; continue; }
+        if (c == 41) { toks.push(PTok::Rp); pos = pos + 1; continue; }
+        if (c == 93) { toks.push(PTok::Rb); pos = pos + 1; continue; }
+        if (c == 124) { toks.push(PTok::Pipe); pos = pos + 1; continue; }  // |
+        if (c == 38) { toks.push(PTok::Amp); pos = pos + 1; continue; }    // &
+        if (c == 91) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 63)) {
+                toks.push(PTok::Filter);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(PTok::Lb);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 46) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 46)) {
+                toks.push(PTok::Ddot);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(PTok::Dot);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 64) {
+            // @ alone is "this"; @foo is a field named "@foo"
+            if ((pos + 1 < n) && (is_ident_start(expr[pos + 1]) == 1)) {
+                let sidx = lex_ident(expr, &mut pos, vals);
+                toks.push(PTok::Field(sidx));
+                continue;
+            }
+            toks.push(PTok::Cur);
+            pos = pos + 1;
+            continue;
+        }
+        // filter comparison operators (ext)
+        if (c == 61) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) { toks.push(PTok::Eq); pos = pos + 2; continue; }
+            if ((pos + 1 < n) && (expr[pos + 1] == 126)) { toks.push(PTok::Tilde); pos = pos + 2; continue; }
+            toks.push(PTok::Eq); pos = pos + 1; continue;
+        }
+        if (c == 33) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) { toks.push(PTok::Ne); pos = pos + 2; continue; }
+            toks.push(PTok::Ne); pos = pos + 1; continue;
+        }
+        if (c == 60) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) { toks.push(PTok::Le); pos = pos + 2; continue; }
+            toks.push(PTok::Lt); pos = pos + 1; continue;
+        }
+        if (c == 62) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) { toks.push(PTok::Ge); pos = pos + 2; continue; }
+            toks.push(PTok::Gt); pos = pos + 1; continue;
+        }
+        if (c == 126) { toks.push(PTok::Tilde); pos = pos + 1; continue; }
+        // keywords: where / wherenot
+        if (c == 119) { // w
+            if (pos + 8 <= n) {
+                let w8 = substr(expr, pos, pos + 8);
+                if (str_cmp(w8, "wherenot") == 0) {
+                    toks.push(PTok::WhereNot); pos = pos + 8; str_free(w8); continue;
+                }
+                str_free(w8);
+            }
+            if (pos + 5 <= n) {
+                let w5 = substr(expr, pos, pos + 5);
+                if (str_cmp(w5, "where") == 0) {
+                    toks.push(PTok::Where); pos = pos + 5; str_free(w5); continue;
+                }
+                str_free(w5);
+            }
+        }
+        // quoted strings
+        if ((c == 39) || (c == 34) || (c == 96)) {
+            let sidx = lex_quoted(expr, &mut pos, c, vals);
+            toks.push(PTok::Str(sidx));
+            continue;
+        }
+        // booleans
+        if (c == 116) { // t
+            if ((pos + 4 <= n) && (substr(expr, pos, pos + 4) == "true")) {
+                toks.push(PTok::Bool(1)); pos = pos + 4; continue;
+            }
+        }
+        if (c == 102) { // f
+            if ((pos + 5 <= n) && (substr(expr, pos, pos + 5) == "false")) {
+                toks.push(PTok::Bool(0)); pos = pos + 5; continue;
+            }
+        }
+        // negative number
+        if (c == 45) {
+            if ((pos + 1 < n) && (is_digit(expr[pos + 1]) == 1)) {
+                let start = pos;
+                pos = pos + 1;
+                while ((pos < n) && (is_digit(expr[pos]) == 1)) {
+                    pos = pos + 1;
+                }
+                // float literal: -digits.digits
+                if ((pos < n) && (expr[pos] == 46) && (pos + 1 < n) && (is_digit(expr[pos + 1]) == 1)) {
+                    pos = pos + 1;
+                    while ((pos < n) && (is_digit(expr[pos]) == 1)) {
+                        pos = pos + 1;
+                    }
+                    let sub = substr(expr, start, pos);
+                    let v = parse_fixed_range(sub, 0, len(sub));
+                    str_free(sub);
+                    toks.push(PTok::FNum(v));
+                    continue;
+                }
+                let sub = substr(expr, start, pos);
+                let v = str_to_i64_parse(sub);
+                str_free(sub);
+                toks.push(PTok::Num(0 - v));
+                continue;
+            }
+        }
+        // number (integer or float literal)
+        if (is_digit(c) == 1) {
+            let start = pos;
+            while ((pos < n) && (is_digit(expr[pos]) == 1)) {
+                pos = pos + 1;
+            }
+            // float literal: digits . digits
+            if ((pos < n) && (expr[pos] == 46) && (pos + 1 < n) && (is_digit(expr[pos + 1]) == 1)) {
+                pos = pos + 1;
+                while ((pos < n) && (is_digit(expr[pos]) == 1)) {
+                    pos = pos + 1;
+                }
+                let sub = substr(expr, start, pos);
+                let v = parse_fixed_range(sub, 0, len(sub));
+                str_free(sub);
+                toks.push(PTok::FNum(v));
+                continue;
+            }
+            let sub = substr(expr, start, pos);
+            let v = str_to_i64_parse(sub);
+            str_free(sub);
+            toks.push(PTok::Num(v));
+            continue;
+        }
+        // identifier (possibly @-prefixed, handled above)
+        if (is_ident_start(c) == 1) {
+            let sidx = lex_ident(expr, &mut pos, vals);
+            toks.push(PTok::Field(sidx));
+            continue;
+        }
+        *err = 1;
+        toks.push(PTok::Eof);
+        return toks;
+    }
+    toks.push(PTok::Eof);
+    return toks;
+}
+
+// =====================================================================
+// JSONPath parser (Pratt). Produces a PAst arena; filter conditions go
+// into a separate fxs arena referenced by Filter nodes.
+// =====================================================================
+
+fn is_slice_ctx(t0: PTok, t1: PTok) -> i64 {
+    // A `[` group is a slice when it contains a ':'; we peek ahead for it.
+    let ty0 = ptok_type(t0);
+    let ty1 = ptok_type(t1);
+    if (ty1 == 13) { return 1; }        // Num ':' ...
+    if (ty0 == 13) { return 1; }        // ':' ...
+    if (ty1 == 5) { return 1; }         // '*' ':' ...  (only via [*:] which jsonpath-ng supports? treat as slice)
+    return 0;
+}
+
+fn skip_to_rb(tokens: &Vec<PTok>, ti: &mut i64) {
+    let n = tokens.len();
+    while ((*ti < n) && (ptok_type(tokens.get(*ti)) != 9)) {
+        *ti = *ti + 1;
+    }
+    if (*ti < n) {
+        *ti = *ti + 1; // consume ]
+    }
+}
+
+// Parse a single index/slice group inside [...]. Called after '[' consumed.
+// Returns the PAst index. Handles:
+//   [0]  [0,1]  [5]       -> Index
+//   [*]                    -> Slice()
+//   [a:b] [a:b:c] [a:] [:] etc -> Slice
+fn parse_index_group(tokens: &Vec<PTok>, ti: &mut i64, ast: &mut Vec<PAst>, err: &mut i64) -> i64 {
+    let t0 = tokens.get(*ti);
+    let ty0 = ptok_type(t0);
+    // [*]
+    if (ty0 == 5) {
+        let t1 = tokens.get(*ti + 1);
+        if (ptok_type(t1) == 9) {
+            *ti = *ti + 2;
+            return pas_push(ast, PAst::Slice(Tri { a: none_sentinel(), b: none_sentinel(), c: none_sentinel() }));
+        }
+        *err = 1;
+        skip_to_rb(tokens, ti);
+        return 0;
+    }
+    // Peek whether this group contains a ':' anywhere before ']' or ','.
+    // If so it is a slice: [a:b] [a:b:c] [a:] [:b] [:b:c].
+    let mut p = *ti;
+    let mut is_slice = 0;
+    while (1 == 1) {
+        let tp = tokens.get(p);
+        let typ = ptok_type(tp);
+        if (typ == 13) { is_slice = 1; break; }
+        if (typ == 9) { break; }
+        if (typ == 12) { break; }   // comma -> index list
+        if (typ == 0) { break; }
+        p = p + 1;
+    }
+    if (is_slice == 1) {
+        return parse_slice_group(tokens, ti, ast, err);
+    }
+    // index list: [n] or [n,m,...]
+    let nums: Vec<i64> = Vec::new();
+    while (1 == 1) {
+        let t = tokens.get(*ti);
+        let ty = ptok_type(t);
+        if (ty == 2) {
+            nums.push(ptok_num(t));
+            *ti = *ti + 1;
+        } else if (ty == 9) {
+            *ti = *ti + 1;
+            break;
+        } else if (ty == 12) {
+            *ti = *ti + 1;
+            continue;
+        } else {
+            *err = 1;
+            skip_to_rb(tokens, ti);
+            return 0;
+        }
+    }
+    if (nums.len() == 0) {
+        *err = 1;
+        return 0;
+    }
+    return pas_push(ast, PAst::Index(nums));
+}
+
+// Parse a slice group [a:b] [a:b:c] [a:] [:b] [:b:c] [::c] [a::c].
+// Called with *ti pointing at the first token inside '['. Consumes up to ']'.
+fn parse_slice_group(tokens: &Vec<PTok>, ti: &mut i64, ast: &mut Vec<PAst>, err: &mut i64) -> i64 {
+    let mut start: i64 = none_sentinel();
+    let mut end: i64 = none_sentinel();
+    let mut step: i64 = none_sentinel();
+    // first segment: optional number
+    let t0 = tokens.get(*ti);
+    if (ptok_type(t0) == 2) {
+        start = ptok_num(t0);
+        *ti = *ti + 1;
+    }
+    // expect ':'
+    let t1 = tokens.get(*ti);
+    if (ptok_type(t1) != 13) {
+        *err = 1;
+        skip_to_rb(tokens, ti);
+        return 0;
+    }
+    *ti = *ti + 1;
+    // second segment: optional number
+    let t2 = tokens.get(*ti);
+    if (ptok_type(t2) == 2) {
+        end = ptok_num(t2);
+        *ti = *ti + 1;
+    }
+    // optional ':step'
+    let t3 = tokens.get(*ti);
+    if (ptok_type(t3) == 13) {
+        *ti = *ti + 1;
+        let t4 = tokens.get(*ti);
+        if (ptok_type(t4) == 2) {
+            step = ptok_num(t4);
+            *ti = *ti + 1;
+        }
+    }
+    // expect ']'
+    let t5 = tokens.get(*ti);
+    if (ptok_type(t5) == 9) {
+        *ti = *ti + 1;
+    } else {
+        *err = 1;
+        skip_to_rb(tokens, ti);
+        return 0;
+    }
+    return pas_push(ast, PAst::Slice(Tri { a: start, b: end, c: step }));
+}
+
+// Parse a fields group inside [...] like [foo] ['foo'] ["foo"] [foo,bar].
+fn parse_fields_group(tokens: &Vec<PTok>, ti: &mut i64, ast: &mut Vec<PAst>, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let names: Vec<i64> = Vec::new();
+    while (1 == 1) {
+        let t = tokens.get(*ti);
+        let ty = ptok_type(t);
+        if (ty == 1) {
+            names.push(ptok_field(t));
+            *ti = *ti + 1;
+        } else if (ty == 27) {
+            names.push(ptok_str(t));
+            *ti = *ti + 1;
+        } else if (ty == 2) {
+            // numeric key, e.g. [1] as a field name on a dict (jsonpath-ng treats NUMBER as field too)
+            let n = ptok_num(t);
+            let sb = String::new();
+            sb.push_str(int_to_str(n));
+            let s = sb.data();
+            let sidx = push_str_value(vals, s);
+            names.push(sidx);
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+            skip_to_rb(tokens, ti);
+            return 0;
+        }
+        let tc = tokens.get(*ti);
+        let tyc = ptok_type(tc);
+        if (tyc == 12) {
+            *ti = *ti + 1;
+            continue;
+        } else if (tyc == 9) {
+            *ti = *ti + 1;
+            break;
+        } else {
+            *err = 1;
+            skip_to_rb(tokens, ti);
+            return 0;
+        }
+    }
+    return pas_push(ast, PAst::Fields(names));
+}
+
+// Postfix step: after parsing a primary, handle `.field`, `..field`,
+// `[group]` and `[?(filter)]` chains.
+fn parse_postfix(tokens: &Vec<PTok>, ti: &mut i64, ast: &mut Vec<PAst>, fxs: &mut Vec<Fx>, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let mut left = 0;
+    // primary
+    let t0 = tokens.get(*ti);
+    let ty0 = ptok_type(t0);
+    if (ty0 == 3) { left = pas_push(ast, PAst::Root); *ti = *ti + 1; }
+    else if (ty0 == 4) { left = pas_push(ast, PAst::This); *ti = *ti + 1; }
+    else if (ty0 == 5) {
+        // bare * at primary position -> wildcard field
+        let names: Vec<i64> = Vec::new();
+        left = pas_push(ast, PAst::Fields(names));
+        *ti = *ti + 1;
+    }
+    else if (ty0 == 1) {
+        let mut names: Vec<i64> = Vec::new();
+        names.push(ptok_field(t0));
+        *ti = *ti + 1;
+        left = pas_push(ast, PAst::Fields(names));
+    }
+    else if (ty0 == 27) {
+        let mut names: Vec<i64> = Vec::new();
+        names.push(ptok_str(t0));
+        *ti = *ti + 1;
+        left = pas_push(ast, PAst::Fields(names));
+    }
+    else if (ty0 == 8) {
+        // [ group at primary position: index/slice/fields/filter
+        *ti = *ti + 1;
+        let t1 = tokens.get(*ti);
+        let ty1 = ptok_type(t1);
+        if (ty1 == 18) {
+            // filter
+            *ti = *ti + 1;
+            left = parse_filter_body(tokens, ti, ast, fxs, vals, err);
+        } else if (is_slice_ctx(t1, tokens.get(*ti + 1)) == 1) {
+            left = parse_index_group(tokens, ti, ast, err);
+        } else if ((ty1 == 1) || (ty1 == 27)) {
+            left = parse_fields_group(tokens, ti, ast, vals, err);
+        } else {
+            left = parse_index_group(tokens, ti, ast, err);
+        }
+    }
+    else if (ty0 == 18) {
+        // [?(...) filter at primary position
+        *ti = *ti + 1;
+        left = parse_filter_body(tokens, ti, ast, fxs, vals, err);
+    }
+    else if (ty0 == 10) {
+        // ( expr )
+        *ti = *ti + 1;
+        left = parse_bp(tokens, ti, ast, fxs, vals, err, 0);
+        let t = tokens.get(*ti);
+        if (ptok_type(t) == 11) {
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+    }
+    else {
+        *err = 1;
+        return 0;
+    }
+
+    // postfix loop
+    while (1 == 1) {
+        let t = tokens.get(*ti);
+        let ty = ptok_type(t);
+        if (ty == 6) {  // .
+            *ti = *ti + 1;
+            let f = tokens.get(*ti);
+            let fy = ptok_type(f);
+            let mut names: Vec<i64> = Vec::new();
+            if (fy == 1) { names.push(ptok_field(f)); *ti = *ti + 1; }
+            else if (fy == 5) { *ti = *ti + 1; } // .* -> empty names = wildcard
+            else if (fy == 27) { names.push(ptok_str(f)); *ti = *ti + 1; }
+            else { *err = 1; return 0; }
+            let right = pas_push(ast, PAst::Fields(names));
+            left = pas_push(ast, PAst::Child(Pair { a: left, b: right }));
+        } else if (ty == 7) {  // ..
+            *ti = *ti + 1;
+            let f = tokens.get(*ti);
+            let fy = ptok_type(f);
+            let mut names: Vec<i64> = Vec::new();
+            if (fy == 1) { names.push(ptok_field(f)); *ti = *ti + 1; }
+            else if (fy == 5) { *ti = *ti + 1; }
+            else if (fy == 27) { names.push(ptok_str(f)); *ti = *ti + 1; }
+            else { *err = 1; return 0; }
+            let right = pas_push(ast, PAst::Fields(names));
+            left = pas_push(ast, PAst::Desc(Pair { a: left, b: right }));
+        } else if (ty == 8) {  // [
+            *ti = *ti + 1;
+            let t1 = tokens.get(*ti);
+            let ty1 = ptok_type(t1);
+            let mut right = 0;
+            if (ty1 == 18) {
+                *ti = *ti + 1;
+                right = parse_filter_body(tokens, ti, ast, fxs, vals, err);
+            } else if (is_slice_ctx(t1, tokens.get(*ti + 1)) == 1) {
+                right = parse_index_group(tokens, ti, ast, err);
+            } else if ((ty1 == 1) || (ty1 == 27)) {
+                right = parse_fields_group(tokens, ti, ast, vals, err);
+            } else {
+                right = parse_index_group(tokens, ti, ast, err);
+            }
+            left = pas_push(ast, PAst::Child(Pair { a: left, b: right }));
+        } else if (ty == 18) {  // [?(...) filter postfix
+            *ti = *ti + 1;
+            let right = parse_filter_body(tokens, ti, ast, fxs, vals, err);
+            left = pas_push(ast, PAst::Child(Pair { a: left, b: right }));
+        } else {
+            break;
+        }
+    }
+    return left;
+}
+
+// Parse a filter body after `[?`. Returns the Filter PAst index.
+// The condition list may be wrapped in an optional pair of parens:
+//   [?(x)]            existence
+//   [?(@.a < 10)]     comparison
+//   [?(x & y)]        AND of conditions
+fn parse_filter_body(tokens: &Vec<PTok>, ti: &mut i64, ast: &mut Vec<PAst>, fxs: &mut Vec<Fx>, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let conds: Vec<i64> = Vec::new();
+    // optional wrapping paren around the whole condition list
+    let mut paren: i64 = 0;
+    let t0 = tokens.get(*ti);
+    if (ptok_type(t0) == 10) {
+        paren = 1;
+        *ti = *ti + 1;
+    }
+    while (1 == 1) {
+        // parse the left side as a full jsonpath (usually @.field)
+        let lnode = parse_bp(tokens, ti, ast, fxs, vals, err, 0);
+        if (*err != 0) { skip_to_rb(tokens, ti); return 0; }
+        // check for an operator
+        let to = tokens.get(*ti);
+        let tyo = ptok_type(to);
+        let mut op: i64 = 0;
+        let mut rval: i64 = -1;
+        let mut ri: i64 = 0;
+        if (tyo == 23) { op = 1; *ti = *ti + 1; }          // ==
+        else if (tyo == 24) { op = 2; *ti = *ti + 1; }     // !=
+        else if (tyo == 21) { op = 3; *ti = *ti + 1; }     // <
+        else if (tyo == 22) { op = 4; *ti = *ti + 1; }     // <=
+        else if (tyo == 19) { op = 5; *ti = *ti + 1; }     // >
+        else if (tyo == 20) { op = 6; *ti = *ti + 1; }     // >=
+        else if (tyo == 25) { op = 7; *ti = *ti + 1; }     // =~ (unsupported -> no-op)
+        if (op != 0) {
+            let tv = tokens.get(*ti);
+            let tyv = ptok_type(tv);
+            if (tyv == 2) {  // integer
+                rval = push_num_value(vals, ptok_num(tv));
+                ri = 1;
+                *ti = *ti + 1;
+            } else if (tyv == 28) {  // float literal
+                rval = push_num_raw(vals, ptok_fnum(tv));
+                ri = 0;
+                *ti = *ti + 1;
+            } else if (tyv == 27) {  // quoted string
+                rval = ptok_str(tv);
+                *ti = *ti + 1;
+            } else if (tyv == 26) {  // bool
+                rval = push_bool_value(vals, ptok_bool(tv));
+                *ti = *ti + 1;
+            } else if (tyv == 1) {  // bare identifier (string literal)
+                rval = ptok_field(tv);
+                *ti = *ti + 1;
+            } else {
+                *err = 1;
+                skip_to_rb(tokens, ti);
+                return 0;
+            }
+        }
+        let fxi = fxs.len();
+        let fx = Fx { l: lnode, op: op, r: rval, ri: ri };
+        fxs.push(fx);
+        conds.push(fxi);
+        // check & or end
+        let tc = tokens.get(*ti);
+        let tyc = ptok_type(tc);
+        if (tyc == 15) {  // &
+            *ti = *ti + 1;
+            continue;
+        }
+        break;
+    }
+    if (paren == 1) {
+        let t = tokens.get(*ti);
+        if (ptok_type(t) != 11) {  // expect )
+            *err = 1;
+            skip_to_rb(tokens, ti);
+            return 0;
+        }
+        *ti = *ti + 1;
+    }
+    let t2 = tokens.get(*ti);
+    if (ptok_type(t2) != 9) {  // expect ]
+        *err = 1;
+        skip_to_rb(tokens, ti);
+        return 0;
+    }
+    *ti = *ti + 1;
+    return pas_push(ast, PAst::Filter(conds));
+}
+
+// Pratt entry: low-precedence operators (where/wherenot/|/&) over postfix.
+fn parse_bp(tokens: &Vec<PTok>, ti: &mut i64, ast: &mut Vec<PAst>, fxs: &mut Vec<Fx>, vals: &mut Vec<Jv>, err: &mut i64, min_bp: i64) -> i64 {
+    let mut left = parse_postfix(tokens, ti, ast, fxs, vals, err);
+    if (*err != 0) { return 0; }
+    while (1 == 1) {
+        let t = tokens.get(*ti);
+        let ty = ptok_type(t);
+        if (ty == 16) {  // where
+            if (10 < min_bp) { break; }
+            *ti = *ti + 1;
+            let right = parse_bp(tokens, ti, ast, fxs, vals, err, 10);
+            left = pas_push(ast, PAst::Where(Pair { a: left, b: right }));
+        } else if (ty == 17) {  // wherenot
+            if (10 < min_bp) { break; }
+            *ti = *ti + 1;
+            let right = parse_bp(tokens, ti, ast, fxs, vals, err, 10);
+            left = pas_push(ast, PAst::Where(Pair { a: left, b: right }));
+        } else if (ty == 14) {  // |
+            if (20 < min_bp) { break; }
+            *ti = *ti + 1;
+            let right = parse_bp(tokens, ti, ast, fxs, vals, err, 20);
+            left = pas_push(ast, PAst::Union(Pair { a: left, b: right }));
+        } else if (ty == 15) {  // &
+            if (20 < min_bp) { break; }
+            *ti = *ti + 1;
+            let right = parse_bp(tokens, ti, ast, fxs, vals, err, 20);
+            left = pas_push(ast, PAst::Union(Pair { a: left, b: right }));
+        } else {
+            break;
+        }
+    }
+    return left;
+}
+
+fn parse_jsonpath_expr(expr: str, vals: &mut Vec<Jv>, ast: &mut Vec<PAst>, fxs: &mut Vec<Fx>, err: &mut i64) -> i64 {
+    let toks = plex(expr, vals, err);
+    if (*err != 0) { return 0; }
+    let mut ti: i64 = 0;
+    let root = parse_bp(&toks, &mut ti, ast, fxs, vals, err, 0);
+    if (*err != 0) { return 0; }
+    // ensure the whole token stream was consumed
+    let t = toks.get(ti);
+    if (ptok_type(t) != 0) {
+        *err = 1;
+        return 0;
+    }
+    return root;
+}
+
+// =====================================================================
+// JSONPath evaluator. Every match is a value index in `vals`.
+// find_value(node, cur) returns the list of value indices matched by
+// applying `node` to the datum `cur` (which is itself a value index).
+// =====================================================================
+
+fn jv_tag(v: Jv) -> i64 {
+    match (v) {
+        Null => { return 0; }
+        B(x) => { return 1; }
+        N(x) => { return 2; }
+        S(s) => { return 3; }
+        A(items) => { return 4; }
+        O(pairs) => { return 5; }
+    }
+    return -1;
+}
+
+fn push_null(vals: &mut Vec<Jv>) -> i64 {
+    vals.push(Jv::Null);
+    return vals.len() - 1;
+}
+
+// Collect values of an object (wildcard) into a fresh list of value indices.
+fn object_values(o: Vec<i64>) -> Vec<i64> {
+    let r: Vec<i64> = Vec::new();
+    let n = o.len();
+    let i = 0;
+    while (i < n) {
+        r.push(o.get(i + 1));
+        i = i + 2;
+    }
+    return r;
+}
+
+fn is_null_idx(vals: &mut Vec<Jv>, idx: i64) -> i64 {
+    if (jv_tag(vals.get(idx)) == 0) { return 1; }
+    return 0;
+}
+
+// Find the value for a single field name on a dict datum; -1 if absent.
+fn field_lookup1(vals: &mut Vec<Jv>, cur: i64, name: str) -> i64 {
+    let v = vals.get(cur);
+    match (v) {
+        O(pairs) => {
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                let ki = pairs.get(i);
+                if (str_cmp(as_str(vals.get(ki)), name) == 0) {
+                    return pairs.get(i + 1);
+                }
+                i = i + 2;
+            }
+            return -1;
+        }
+        _ => { }
+    }
+    return -1;
+}
+
+// Python-style slice iteration over an array value index.
+// Returns a list of element value indices. Follows jsonpath-ng's
+// range(0, len)[start:end:step] semantics (negative indices supported).
+fn slice_array(items: Vec<i64>, start: i64, end: i64, step: i64) -> Vec<i64> {
+    let r: Vec<i64> = Vec::new();
+    let l = items.len();
+    if (l == 0) { return r; }
+    let mut s = start;
+    let mut e = end;
+    let mut st = step;
+    if (st == none_sentinel()) {
+        st = 1;
+    }
+    if (st == 0) {
+        return r;
+    }
+    // normalize negative indices
+    if (s == none_sentinel()) {
+        if (st > 0) { s = 0; } else { s = l - 1; }
+    } else if (s < 0) {
+        s = l + s;
+    }
+    if (e == none_sentinel()) {
+        if (st > 0) { e = l; } else { e = -1; }
+    } else if (e < 0) {
+        e = l + e;
+    }
+    if (st > 0) {
+        let mut i = s;
+        while (i < e) {
+            if ((i >= 0) && (i < l)) {
+                r.push(items.get(i));
+            }
+            i = i + st;
+        }
+    } else {
+        let mut i = s;
+        while (i > e) {
+            if ((i >= 0) && (i < l)) {
+                r.push(items.get(i));
+            }
+            i = i + st;
+        }
+    }
+    return r;
+}
+
+// Evaluate a filter condition fx against candidate value index `cur`.
+// Returns 1 if the condition holds. op semantics mirror jsonpath-ng:
+//   numbers compare numerically; strings compare lexically; existence
+//   check (op==0) is true when the target path yields a match.
+fn filter_match(fx: Fx, fxs: &mut Vec<Fx>, ast: &mut Vec<PAst>, vals: &mut Vec<Jv>, cur: i64, err: &mut i64) -> i64 {
+    let left = fx.l;
+    let matches = find_value(left, ast, fxs, vals, cur, err);
+    if (*err != 0) { return 0; }
+    if (fx.op == 0) {
+        // existence: non-empty match list
+        if (matches.len() > 0) { return 1; }
+        return 0;
+    }
+    if (matches.len() == 0) {
+        return 0;
+    }
+    let lv = matches.get(0);
+    // rhs value
+    let rv = fx.r;
+    if (rv < 0) { return 0; }
+    let op = fx.op;
+    // jsonpath-ng: if the rhs is an int, coerce the lhs to int
+    let lt = jv_tag(vals.get(lv));
+    let rt = jv_tag(vals.get(rv));
+    if ((lt == 2) && (rt == 2)) {
+        let mut x = as_num(vals.get(lv));
+        let mut y = as_num(vals.get(rv));
+        // jsonpath-ng: if RHS is int, coerce LHS to int(via truncation)
+        if (fx.ri == 1) {
+            x = x / 1000000;
+            y = y / 1000000;
+        }
+        if (op == 1) { if (x == y) { return 1; } return 0; }
+        if (op == 2) { if (x != y) { return 1; } return 0; }
+        if (op == 3) { if (x < y) { return 1; } return 0; }
+        if (op == 4) { if (x <= y) { return 1; } return 0; }
+        if (op == 5) { if (x > y) { return 1; } return 0; }
+        if (op == 6) { if (x >= y) { return 1; } return 0; }
+        return 0;
+    }
+    // booleans
+    if ((lt == 1) && (rt == 1)) {
+        let x = b2i(as_bool(vals.get(lv)));
+        let y = b2i(as_bool(vals.get(rv)));
+        if (op == 1) { if (x == y) { return 1; } return 0; }
+        if (op == 2) { if (x != y) { return 1; } return 0; }
+        return 0;
+    }
+    // strings
+    if ((lt == 3) && (rt == 3)) {
+        let x = as_str(vals.get(lv));
+        let y = as_str(vals.get(rv));
+        let c = str_cmp(x, y);
+        if (op == 1) { if (c == 0) { return 1; } return 0; }
+        if (op == 2) { if (c != 0) { return 1; } return 0; }
+        if (op == 3) { if (c < 0) { return 1; } return 0; }
+        if (op == 4) { if (c <= 0) { return 1; } return 0; }
+        if (op == 5) { if (c > 0) { return 1; } return 0; }
+        if (op == 6) { if (c >= 0) { return 1; } return 0; }
+        return 0;
+    }
+    // mixed or non-comparable -> false (jsonpath-ng raises/returns falsy; we return 0)
+    return 0;
+}
+
+fn find_value(node: i64, ast: &mut Vec<PAst>, fxs: &mut Vec<Fx>, vals: &mut Vec<Jv>, cur: i64, err: &mut i64) -> Vec<i64> {
+    let mut res: Vec<i64> = Vec::new();
+    match (ast.get(node)) {
+        PAst::Root => {
+            res.push(cur);
+            return res;
+        }
+        PAst::This => {
+            res.push(cur);
+            return res;
+        }
+        PAst::Fields(names) => {
+            let v = vals.get(cur);
+            match (v) {
+                O(pairs) => {
+                    if (names.len() == 0) {
+                        // wildcard: all values
+                        return object_values(pairs);
+                    }
+                    let n = names.len();
+                    let i = 0;
+                    while (i < n) {
+                        let nm = as_str(vals.get(names.get(i)));
+                        let fv = field_lookup1(vals, cur, nm);
+                        if (fv >= 0) {
+                            res.push(fv);
+                        }
+                        i = i + 1;
+                    }
+                    return res;
+                }
+                _ => {
+                    return res;
+                }
+            }
+        }
+        PAst::Index(idxs) => {
+            let v = vals.get(cur);
+            match (v) {
+                A(items) => {
+                    let l = items.len();
+                    let n = idxs.len();
+                    let i = 0;
+                    while (i < n) {
+                        let mut idx = idxs.get(i);
+                        if (idx < 0) {
+                            idx = l + idx;
+                        }
+                        if ((idx >= 0) && (idx < l)) {
+                            res.push(items.get(idx));
+                        }
+                        i = i + 1;
+                    }
+                    return res;
+                }
+                _ => {
+                    return res;
+                }
+            }
+        }
+        PAst::Slice(t) => {
+            let tg = jv_tag(vals.get(cur));
+            if (tg == 4) {
+                let items = as_arr(vals.get(cur));
+                return slice_array(items, t.a, t.b, t.c);
+            }
+            if (tg == 5) {
+                let wrap: Vec<i64> = Vec::new();
+                wrap.push(cur);
+                return slice_array(wrap, t.a, t.b, t.c);
+            }
+            if (tg == 2) {
+                let wrap: Vec<i64> = Vec::new();
+                wrap.push(cur);
+                return slice_array(wrap, t.a, t.b, t.c);
+            }
+            if (tg == 3) {
+                let wrap: Vec<i64> = Vec::new();
+                wrap.push(cur);
+                return slice_array(wrap, t.a, t.b, t.c);
+            }
+            if (tg == 1) {
+                let wrap: Vec<i64> = Vec::new();
+                wrap.push(cur);
+                return slice_array(wrap, t.a, t.b, t.c);
+            }
+            return res;
+        }
+        PAst::Child(p) => {
+            let lm = find_value(p.a, ast, fxs, vals, cur, err);
+            if (*err != 0) { return res; }
+            let ln = lm.len();
+            let i = 0;
+            while (i < ln) {
+                let sub = find_value(p.b, ast, fxs, vals, lm.get(i), err);
+                if (*err != 0) { return res; }
+                let sn = sub.len();
+                let j = 0;
+                while (j < sn) {
+                    res.push(sub.get(j));
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return res;
+        }
+        PAst::Desc(p) => {
+            let lm = find_value(p.a, ast, fxs, vals, cur, err);
+            if (*err != 0) { return res; }
+            let ln = lm.len();
+            let i = 0;
+            let mut acc: Vec<i64> = Vec::new();
+            while (i < ln) {
+                acc = desc_append(ast, fxs, vals, p.b, lm.get(i), acc, err);
+                if (*err != 0) { return acc; }
+                i = i + 1;
+            }
+            return acc;
+        }
+        PAst::Where(p) => {
+            let lm = find_value(p.a, ast, fxs, vals, cur, err);
+            if (*err != 0) { return res; }
+            let ln = lm.len();
+            let i = 0;
+            while (i < ln) {
+                let rm = find_value(p.b, ast, fxs, vals, lm.get(i), err);
+                if (*err != 0) { return res; }
+                if (rm.len() > 0) {
+                    res.push(lm.get(i));
+                }
+                i = i + 1;
+            }
+            return res;
+        }
+        PAst::Union(p) => {
+            let lm = find_value(p.a, ast, fxs, vals, cur, err);
+            if (*err != 0) { return res; }
+            let rm = find_value(p.b, ast, fxs, vals, cur, err);
+            if (*err != 0) { return res; }
+            let ln = lm.len();
+            let i = 0;
+            while (i < ln) {
+                res.push(lm.get(i));
+                i = i + 1;
+            }
+            let rn = rm.len();
+            let j = 0;
+            while (j < rn) {
+                res.push(rm.get(j));
+                j = j + 1;
+            }
+            return res;
+        }
+        PAst::Filter(conds) => {
+            let tg = jv_tag(vals.get(cur));
+            if (tg == 5) {
+                let ov = object_values(as_obj(vals.get(cur)));
+                let n = ov.len();
+                let i = 0;
+                while (i < n) {
+                    if (filter_all(conds, fxs, ast, vals, ov.get(i), err) == 1) {
+                        res.push(ov.get(i));
+                    }
+                    if (*err != 0) { return res; }
+                    i = i + 1;
+                }
+                return res;
+            }
+            if (tg == 4) {
+                let items = as_arr(vals.get(cur));
+                let n = items.len();
+                let i = 0;
+                while (i < n) {
+                    if (filter_all(conds, fxs, ast, vals, items.get(i), err) == 1) {
+                        res.push(items.get(i));
+                    }
+                    if (*err != 0) { return res; }
+                    i = i + 1;
+                }
+                return res;
+            }
+            return res;
+        }
+        _ => {
+            return res;
+        }
+    }
+}
+
+// Check all filter conditions in `conds` against candidate `cur` (AND).
+fn filter_all(conds: &Vec<i64>, fxs: &mut Vec<Fx>, ast: &mut Vec<PAst>, vals: &mut Vec<Jv>, cur: i64, err: &mut i64) -> i64 {
+    let n = conds.len();
+    let i = 0;
+    while (i < n) {
+        let fx = fxs.get(conds.get(i));
+        if (filter_match(fx, fxs, ast, vals, cur, err) == 0) {
+            return 0;
+        }
+        if (*err != 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Descendants: right.find(datum) then recurse into the datum's children,
+// appending matches to `acc`. Mirrors jsonpath-ng's match_recursively.
+fn desc_append(ast: &mut Vec<PAst>, fxs: &mut Vec<Fx>, vals: &mut Vec<Jv>, right: i64, cur: i64, acc: Vec<i64>, err: &mut i64) -> Vec<i64> {
+    let mut r = acc;
+    let rm = find_value(right, ast, fxs, vals, cur, err);
+    if (*err != 0) { return r; }
+    let rn = rm.len();
+    let i = 0;
+    while (i < rn) {
+        r.push(rm.get(i));
+        i = i + 1;
+    }
+    let tg = jv_tag(vals.get(cur));
+    if (tg == 4) {
+        let items = as_arr(vals.get(cur));
+        let n = items.len();
+        let j = 0;
+        while (j < n) {
+            r = desc_append(ast, fxs, vals, right, items.get(j), r, err);
+            if (*err != 0) { return r; }
+            j = j + 1;
+        }
+    } else if (tg == 5) {
+        let ov = object_values(as_obj(vals.get(cur)));
+        let n = ov.len();
+        let j = 0;
+        while (j < n) {
+            r = desc_append(ast, fxs, vals, right, ov.get(j), r, err);
+            if (*err != 0) { return r; }
+            j = j + 1;
+        }
+    }
+    return r;
+}
+
+// Serialize a list of value indices as a JSON array of the matched values.
+fn ser_matches(matches: &Vec<i64>, vals: &Vec<Jv>, out: &mut Vec<i64>) {
+    out.push(91);
+    let n = matches.len();
+    let i = 0;
+    while (i < n) {
+        if (i > 0) { out.push(44); }
+        ser_idx(matches.get(i), vals, out);
+        i = i + 1;
+    }
+    out.push(93);
+}
+
+// Strict JSON document parse, mirroring json.loads behaviour.
+fn parse_document(data: str, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let n = len(data);
+    let mut start = 0;
+    ws_skip(data, n, &mut start);
+    if (start >= n) {
+        *err = 1;
+        return 0;
+    }
+    let c = data[start];
+    let valid_start = ((c == 123) || (c == 91) || (c == 34) || (c == 116)
+        || (c == 102) || (c == 110) || ((c >= 48) && (c <= 57)) || (c == 45));
+    if (b2i(valid_start) == 0) {
+        *err = 1;
+        return 0;
+    }
+    let mut jpos = start;
+    let root = parse_value(data, n, &mut jpos, vals, err);
+    if (*err != 0) { return 0; }
+    let mut endpos = jpos;
+    ws_skip(data, n, &mut endpos);
+    if (endpos != n) {
+        *err = 1;
+        return 0;
+    }
+    return root;
+}
+
+#[py_export]
+fn search(expr: str, data: str) -> String {
+    let vals: Vec<Jv> = Vec::new();
+    let mut err: i64 = 0;
+    let root = parse_document(data, &mut vals, &mut err);
+    if (err != 0) {
+        let mut out = String::new();
+        out.push(30);
+        out.push_str("ERR1");
+        return out;
+    }
+    let mut ast: Vec<PAst> = Vec::new();
+    let mut fxs: Vec<Fx> = Vec::new();
+    let root_ast = parse_jsonpath_expr(expr, &mut vals, &mut ast, &mut fxs, &mut err);
+    if (err != 0) {
+        let mut out = String::new();
+        out.push(30);
+        out.push_str("ERR1");
+        return out;
+    }
+    let matches = find_value(root_ast, &mut ast, &mut fxs, &mut vals, root, &mut err);
+    if (err != 0) {
+        let mut out = String::new();
+        out.push(30);
+        out.push_str("ERR1");
+        return out;
+    }
+    let mut out: Vec<i64> = Vec::new();
+    ser_matches(&matches, &vals, &mut out);
+    return bytes_to_string(&mut out);
+}
+
+// Debug: dump the parsed AST node types for an expression.
+#[py_export]
+fn dbg_ast(expr: str) -> String {
+    let mut vals: Vec<Jv> = Vec::new();
+    let mut err: i64 = 0;
+    let mut ast: Vec<PAst> = Vec::new();
+    let mut fxs: Vec<Fx> = Vec::new();
+    let toks = plex(expr, &mut vals, &mut err);
+    let mut ti: i64 = 0;
+    let root = parse_bp(&toks, &mut ti, &mut ast, &mut fxs, &mut vals, &mut err, 0);
+    let mut out: Vec<i64> = Vec::new();
+    push_s(&mut out, "err=");
+    out.push(48 + err);
+    push_s(&mut out, " ti=");
+    out.push(48 + ti / 10);
+    out.push(48 + ti % 10);
+    push_s(&mut out, " root=");
+    out.push(48 + root / 10);
+    out.push(48 + root % 10);
+    push_s(&mut out, " astlen=");
+    let al = ast.len();
+    out.push(48 + (al / 100) % 10);
+    out.push(48 + (al / 10) % 10);
+    out.push(48 + al % 10);
+    push_s(&mut out, " fxlen=");
+    let fl = fxs.len();
+    out.push(48 + fl);
+    return bytes_to_string(&mut out);
+}
+
+// Debug: dump the token stream for an expression.
+#[py_export]
+fn dbg_tokens(expr: str) -> String {
+    let mut vals: Vec<Jv> = Vec::new();
+    let mut err: i64 = 0;
+    let toks = plex(expr, &mut vals, &mut err);
+    let mut out: Vec<i64> = Vec::new();
+    let n = toks.len();
+    let i = 0;
+    while (i < n) {
+        let t = toks.get(i);
+        let ty = ptok_type(t);
+        out.push(48 + ty / 10);
+        out.push(48 + ty % 10);
+        out.push(32);
+        i = i + 1;
+    }
+    return bytes_to_string(&mut out);
+}

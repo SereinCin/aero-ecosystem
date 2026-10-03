@@ -1,0 +1,29 @@
+[project]
+name = "aero-jsonpath"
+version = "0.1.0"
+description = "Native JSONPath engine for Python — Aero-compiled kernel with jsonpath-ng compatibility"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "SereinCin"}]
+keywords = ["jsonpath", "json", "query", "native", "aero"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[project.urls]
+Homepage = "https://github.com/SereinCin/aero-jsonpath"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["aero_jsonpath"]
+
+[tool.setuptools.package-data]
+aero_jsonpath = ["*.pyd"]
