@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aero-csv"
+version = "0.1.0"
+description = "Aero-powered CSV batch aggregation kernel — C-speed reducers for your Python data pipeline"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["csv", "batch", "performance", "aero", "data-pipeline", "aggregation"]
+
+[project.urls]
+Homepage = "https://github.com/SereinCin/aero-csv"
+
+[tool.setuptools]
+packages = ["aero_csv"]
