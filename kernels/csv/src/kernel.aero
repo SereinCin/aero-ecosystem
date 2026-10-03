@@ -1,0 +1,116 @@
+// aero_csv kernel: CSV batch aggregation at C speed.
+//
+// Built with `aero build src/kernel.aero --pyext` → `kernel.pyd` (Windows)
+// / `kernel.so` (Linux/macOS), importable from Python.
+//
+// CSV contract (same as the published aero-bench):
+//   - one row per line, comma-separated integer fields
+//   - fields are addressed by 0-based column index
+//
+// Two exported reducers, each a single pass over the input (no UTF-8 decode,
+// no per-row object creation — the interpreter is not in the loop):
+//   - count_if(data, filter_col, filter_val, value_col, min_value)
+//       rows where filter_col == filter_val && value_col > min_value
+//   - sum_mul_if(data, value_col, qty_col, filter_col, filter_val, min_value)
+//       sum of value_col * qty_col over the same rows
+//
+// Together they reproduce the aero-bench pipeline exactly:
+//   count = count_if(data, 3, 1, 1, 5000)
+//   total = sum_mul_if(data, 1, 2, 3, 1, 5000)
+// `aggregate` does the same in a single pass and returns the text result.
+
+fn parse_field(s: str, from: i64, end: i64, idx: i64) -> i64 {
+    // Advance to the start of field `idx` within s[from..end), then parse digits.
+    let pos = 0;
+    let j = from;
+    while (j < end) {
+        if (pos == idx) {
+            break;
+        }
+        if (s[j] == 44) {          // ','
+            pos = pos + 1;
+        }
+        j = j + 1;
+    }
+    let val = 0;
+    while (j < end) {
+        let c = s[j];
+        if ((c == 44) || (c < 48) || (c > 57)) {
+            break;
+        }
+        val = val * 10 + (c - 48);
+        j = j + 1;
+    }
+    return val;
+}
+
+#[py_export]
+fn count_if(data: str, filter_col: i64, filter_val: i64, value_col: i64, min_value: i64) -> i64 {
+    let n = len(data);
+    let count = 0;
+    let ls = 0;
+    let i = 0;
+    while (i <= n) {
+        if ((i == n) || (data[i] == 10)) {
+            let f = parse_field(data, ls, i, filter_col);
+            let v = parse_field(data, ls, i, value_col);
+            if (f == filter_val) {
+                if (v > min_value) {
+                    count = count + 1;
+                }
+            }
+            ls = i + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+#[py_export]
+fn sum_mul_if(data: str, value_col: i64, qty_col: i64, filter_col: i64, filter_val: i64, min_value: i64) -> i64 {
+    let n = len(data);
+    let total = 0;
+    let ls = 0;
+    let i = 0;
+    while (i <= n) {
+        if ((i == n) || (data[i] == 10)) {
+            let f = parse_field(data, ls, i, filter_col);
+            let v = parse_field(data, ls, i, value_col);
+            let q = parse_field(data, ls, i, qty_col);
+            if (f == filter_val) {
+                if (v > min_value) {
+                    total = total + v * q;
+                }
+            }
+            ls = i + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+#[py_export]
+fn aggregate(data: str, price_col: i64, qty_col: i64, active_col: i64, min_price: i64, active_val: i64) -> String {
+    let n = len(data);
+    let count = 0;
+    let total = 0;
+    let ls = 0;
+    let i = 0;
+    while (i <= n) {
+        if ((i == n) || (data[i] == 10)) {
+            let f = parse_field(data, ls, i, active_col);
+            let v = parse_field(data, ls, i, price_col);
+            let q = parse_field(data, ls, i, qty_col);
+            if (f == active_val) {
+                if (v > min_price) {
+                    total = total + v * q;
+                    count = count + 1;
+                }
+            }
+            ls = i + 1;
+        }
+        i = i + 1;
+    }
+    let res = String::from("count=" + int_to_str(count) + "\ntotal=" + int_to_str(total) + "\n");
+    return res;
+}

@@ -1,0 +1,14 @@
+# Compiled extension + generated dataset (regenerate: python build.py / gen)
+aero_csv/kernel.pyd
+aero_csv/kernel.so
+src/kernel.pyd
+src/kernel.so
+src/.aero-cache/
+bench/data.csv
+
+# Python
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
