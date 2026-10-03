@@ -1,0 +1,11 @@
+# Generated dataset (38 MB) — regenerate with gen_data.py
+data.csv
+
+# Aero build artifacts
+src/bench
+src/bench.exe
+src/.aero-cache/
+
+# Python
+__pycache__/
+*.pyc
