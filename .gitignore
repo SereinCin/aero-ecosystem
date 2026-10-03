@@ -1,0 +1,10 @@
+# compiled artifacts
+src/kernel.pyd
+src/kernel.so
+src/kernel.dylib
+aero_jmespath/kernel.pyd
+aero_jmespath/kernel.so
+aero_jmespath/kernel.dylib
+__pycache__/
+*.pyc
+*.aero-cache
